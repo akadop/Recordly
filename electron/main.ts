@@ -46,6 +46,7 @@ import {
 	isHudOverlayMousePassthroughSupported,
 	showUpdateToastWindow,
 } from "./windows";
+import { ensurePackagedRendererServer } from "./rendererServer";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const IS_SMOKE_EXPORT = process.env.RECORDLY_SMOKE_EXPORT === "1";
@@ -159,6 +160,29 @@ function getRecordingTrayIcon() {
 	return recordingTrayIcon;
 }
 
+function showHudOverlayFromTray() {
+	const hud = getHudOverlayWindow();
+	if (!hud) {
+		return false;
+	}
+
+	if (hud.isMinimized()) {
+		hud.restore();
+	}
+
+	if (process.platform === "win32" && isHudOverlayMousePassthroughSupported()) {
+		hud.showInactive();
+		hud.moveTop();
+		reassertHudOverlayMouseState();
+		return true;
+	}
+
+	hud.show();
+	hud.moveTop();
+	hud.focus();
+	return true;
+}
+
 ipcMain.on("set-has-unsaved-changes", (_event, hasChanges: boolean) => {
 	editorHasUnsavedChanges = hasChanges;
 });
@@ -213,6 +237,7 @@ function focusOrCreateMainWindow() {
 			!isEditorWindow(mainWindow) &&
 			isHudOverlayMousePassthroughSupported()
 		) {
+			showHudOverlayFromTray();
 			return;
 		}
 
@@ -370,6 +395,7 @@ function setupApplicationMenu() {
 function createTray() {
 	tray = new Tray(getDefaultTrayIcon());
 	tray.on("click", () => focusOrCreateMainWindow());
+	tray.on("double-click", () => focusOrCreateMainWindow());
 }
 
 function getPublicAssetPath(filename: string) {
@@ -582,6 +608,14 @@ function updateTrayMenu(recording: boolean = false) {
 	const menuTemplate = recording
 		? [
 				{
+					label: "Show Controls",
+					click: () => {
+						if (!showHudOverlayFromTray()) {
+							focusOrCreateMainWindow();
+						}
+					},
+				},
+				{
 					label: "Stop Recording",
 					click: () => {
 						if (mainWindow && !mainWindow.isDestroyed()) {
@@ -594,13 +628,8 @@ function updateTrayMenu(recording: boolean = false) {
 				{
 					label: "Open",
 					click: () => {
-						if (mainWindow && !mainWindow.isDestroyed()) {
-							if (mainWindow.isMinimized()) mainWindow.restore();
-							mainWindow.show();
-							mainWindow.focus();
-							mainWindow.moveTop();
-						} else {
-							createWindow();
+						if (!showHudOverlayFromTray()) {
+							focusOrCreateMainWindow();
 						}
 					},
 				},
@@ -746,6 +775,14 @@ app.whenReady().then(async () => {
 	setupApplicationMenu();
 	// Ensure recordings directory exists
 	await ensureRecordingsDir();
+
+	if (!VITE_DEV_SERVER_URL) {
+		try {
+			await ensurePackagedRendererServer(RENDERER_DIST);
+		} catch (error) {
+			console.warn("[renderer-server] Failed to start packaged renderer server:", error);
+		}
+	}
 
 	registerIpcHandlers(
 		createEditorWindowWrapper,

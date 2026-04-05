@@ -14,7 +14,10 @@ import type {
 } from "@/components/video-editor/types";
 import { AudioProcessor } from "./audioEncoder";
 import { FrameRenderer as ModernFrameRenderer } from "./modernFrameRenderer";
-import { MP4_CODEC_FALLBACK_LIST, type SupportedMp4EncoderPath } from "./mp4Support";
+import {
+	getOrderedSupportedMp4EncoderCandidates,
+	type SupportedMp4EncoderPath,
+} from "./mp4Support";
 import { VideoMuxer } from "./muxer";
 import { captureCanvasFrameForNativeExport } from "./nativeFrameCapture";
 import { type DecodedVideoInfo, StreamingVideoDecoder } from "./streamingDecoder";
@@ -122,7 +125,7 @@ export class ModernVideoExporter {
 	private nativeWriteError: Error | null = null;
 	private maxNativeWriteInFlight = 1;
 	private lastNativeExportError: string | null = null;
-	private readonly WINDOWS_FINALIZATION_TIMEOUT_MS = 180_000;
+	private readonly FINALIZATION_TIMEOUT_MS = 600_000;
 	private totalExportStartTimeMs = 0;
 	private metadataLoadTimeMs = 0;
 	private rendererInitTimeMs = 0;
@@ -132,6 +135,7 @@ export class ModernVideoExporter {
 	private renderFrameTimeMs = 0;
 	private encodeWaitTimeMs = 0;
 	private encodeWaitEvents = 0;
+	private encoderError: Error | null = null;
 	private peakEncodeQueueSize = 0;
 	private peakNativeWriteInFlight = 0;
 	private nativeCaptureTimeMs = 0;
@@ -149,6 +153,7 @@ export class ModernVideoExporter {
 		try {
 			this.cleanup();
 			this.cancelled = false;
+			this.encoderError = null;
 			this.totalExportStartTimeMs = this.getNowMs();
 
 			let stageStartedAt = this.getNowMs();
@@ -168,7 +173,21 @@ export class ModernVideoExporter {
 				}
 			} else {
 				try {
-					await this.initializeEncoder();
+					const configuredWebCodecsPath = await this.initializeEncoder();
+					if (
+						backendPreference === "auto" &&
+						configuredWebCodecsPath.hardwareAcceleration === "prefer-software"
+					) {
+						console.warn(
+							"[VideoExporter] Auto backend resolved to a software WebCodecs encoder; trying Breeze native export instead.",
+						);
+						stageStartedAt = this.getNowMs();
+						useNativeEncoder = await this.tryStartNativeVideoExport();
+						this.nativeSessionStartTimeMs = this.getNowMs() - stageStartedAt;
+						if (useNativeEncoder) {
+							this.disposeEncoder();
+						}
+					}
 				} catch (error) {
 					const webCodecsError = error instanceof Error ? error : new Error(String(error));
 					if (backendPreference === "webcodecs") {
@@ -309,7 +328,7 @@ export class ModernVideoExporter {
 				this.config.frameRate,
 				this.config.trimRegions,
 				this.config.speedRegions,
-				async (videoFrame, _exportTimestampUs, sourceTimestampMs) => {
+				async (videoFrame, _exportTimestampUs, sourceTimestampMs, cursorTimestampMs) => {
 					const callbackStartedAt = this.getNowMs();
 					if (this.cancelled) {
 						videoFrame.close();
@@ -318,8 +337,9 @@ export class ModernVideoExporter {
 
 					const timestamp = frameIndex * frameDuration;
 					const sourceTimestampUs = sourceTimestampMs * 1000;
+					const cursorTimestampUs = cursorTimestampMs * 1000;
 					const renderStartedAt = this.getNowMs();
-					await this.renderer!.renderFrame(videoFrame, sourceTimestampUs);
+					await this.renderer!.renderFrame(videoFrame, sourceTimestampUs, cursorTimestampUs);
 					this.renderFrameTimeMs += this.getNowMs() - renderStartedAt;
 					videoFrame.close();
 
@@ -341,13 +361,22 @@ export class ModernVideoExporter {
 			this.decodeLoopTimeMs = this.getNowMs() - decodeLoopStartedAt;
 
 			if (this.cancelled) {
+				if (this.encoderError) {
+					return {
+						success: false,
+						error: this.buildLightningExportError(this.encoderError),
+						metrics: this.buildExportMetrics(),
+					};
+				}
+
 				return { success: false, error: "Export cancelled", metrics: this.buildExportMetrics() };
 			}
 
-			this.reportProgress(totalFrames, totalFrames, "finalizing");
+			this.reportFinalizingProgress(totalFrames, 96);
 
 			if (useNativeEncoder) {
 				stageStartedAt = this.getNowMs();
+				this.reportFinalizingProgress(totalFrames, 99);
 				const finishResult = await this.finishNativeVideoExport(nativeAudioPlan);
 				this.finalizationTimeMs = this.getNowMs() - stageStartedAt;
 				if (!finishResult.success || !finishResult.blob) {
@@ -367,10 +396,12 @@ export class ModernVideoExporter {
 
 			stageStartedAt = this.getNowMs();
 			if (this.encoder && this.encoder.state === "configured") {
-				await this.awaitWithWindowsTimeout(this.encoder.flush(), "encoder flush");
+				this.reportFinalizingProgress(totalFrames, 97);
+				await this.awaitWithFinalizationTimeout(this.encoder.flush(), "encoder flush");
 			}
 
-			await this.awaitWithWindowsTimeout(this.pendingMuxing, "muxing queued video chunks");
+			this.reportFinalizingProgress(totalFrames, 98);
+			await this.awaitWithFinalizationTimeout(this.pendingMuxing, "muxing queued video chunks");
 
 			if (nativeAudioPlan.audioMode !== "none" && !this.cancelled) {
 				const demuxer = this.streamingDecoder.getDemuxer();
@@ -380,7 +411,8 @@ export class ModernVideoExporter {
 					(this.config.sourceAudioFallbackPaths ?? []).length > 0
 				) {
 					this.audioProcessor = new AudioProcessor();
-					await this.awaitWithWindowsTimeout(
+					this.reportFinalizingProgress(totalFrames, 99);
+					await this.awaitWithFinalizationTimeout(
 						this.audioProcessor.process(
 							demuxer,
 							this.muxer!,
@@ -396,19 +428,21 @@ export class ModernVideoExporter {
 				}
 			}
 
-			const blob = await this.awaitWithWindowsTimeout(this.muxer!.finalize(), "muxer finalization");
+			this.reportFinalizingProgress(totalFrames, 99);
+			const blob = await this.awaitWithFinalizationTimeout(this.muxer!.finalize(), "muxer finalization");
 			this.finalizationTimeMs = this.getNowMs() - stageStartedAt;
 
 			return { success: true, blob, metrics: this.buildExportMetrics() };
 		} catch (error) {
-			if (this.cancelled) {
+			if (this.cancelled && !this.encoderError) {
 				return { success: false, error: "Export cancelled", metrics: this.buildExportMetrics() };
 			}
 
+			const resolvedError = this.encoderError ?? error;
 			console.error("Export error:", error);
 			return {
 				success: false,
-				error: this.buildLightningExportError(error),
+				error: this.buildLightningExportError(resolvedError),
 				metrics: this.buildExportMetrics(),
 			};
 		} finally {
@@ -417,13 +451,6 @@ export class ModernVideoExporter {
 			}
 			this.cleanup();
 		}
-	}
-
-	private isWindowsPlatform(): boolean {
-		if (typeof navigator === "undefined") {
-			return false;
-		}
-		return /Win/i.test(navigator.platform);
 	}
 
 	private getPlatformLabel(): string {
@@ -526,11 +553,7 @@ export class ModernVideoExporter {
 		return lines.join("\n");
 	}
 
-	private async awaitWithWindowsTimeout<T>(promise: Promise<T>, stage: string): Promise<T> {
-		if (!this.isWindowsPlatform()) {
-			return promise;
-		}
-
+	private async awaitWithFinalizationTimeout<T>(promise: Promise<T>, stage: string): Promise<T> {
 		let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
 		try {
@@ -538,8 +561,12 @@ export class ModernVideoExporter {
 				promise,
 				new Promise<T>((_, reject) => {
 					timeoutId = setTimeout(() => {
-						reject(new Error(`Export timed out during ${stage} on Windows`));
-					}, this.WINDOWS_FINALIZATION_TIMEOUT_MS);
+						reject(
+							new Error(
+								`Export timed out during ${stage} after ${Math.round(this.FINALIZATION_TIMEOUT_MS / 60_000)} minutes`,
+							),
+						);
+					}, this.FINALIZATION_TIMEOUT_MS);
 				}),
 			]);
 		} finally {
@@ -768,7 +795,7 @@ export class ModernVideoExporter {
 
 		if (audioPlan.audioMode === "edited-track") {
 			this.audioProcessor = new AudioProcessor();
-			const audioBlob = await this.awaitWithWindowsTimeout(
+			const audioBlob = await this.awaitWithFinalizationTimeout(
 				this.audioProcessor.renderEditedAudioTrack(
 					this.config.videoUrl,
 					this.config.trimRegions,
@@ -792,7 +819,7 @@ export class ModernVideoExporter {
 
 		await this.awaitPendingNativeWrites();
 
-		const result = await this.awaitWithWindowsTimeout(
+		const result = await this.awaitWithFinalizationTimeout(
 			window.electronAPI.nativeVideoExportFinish(sessionId, {
 				audioMode: audioPlan.audioMode,
 				audioSourcePath:
@@ -879,10 +906,15 @@ export class ModernVideoExporter {
 		}
 	}
 
+	private reportFinalizingProgress(totalFrames: number, renderProgress: number) {
+		this.reportProgress(totalFrames, totalFrames, "finalizing", renderProgress);
+	}
+
 	private reportProgress(
 		currentFrame: number,
 		totalFrames: number,
 		phase: ExportProgress["phase"] = "extracting",
+		renderProgress?: number,
 	) {
 		const nowMs = this.getNowMs();
 		const elapsedSeconds = Math.max((nowMs - this.exportStartTimeMs) / 1000, 0.001);
@@ -892,6 +924,16 @@ export class ModernVideoExporter {
 		const sampleRenderFps = (sampleFrameDelta * 1000) / sampleElapsedMs;
 		const remainingFrames = Math.max(totalFrames - currentFrame, 0);
 		const estimatedTimeRemaining = averageRenderFps > 0 ? remainingFrames / averageRenderFps : 0;
+		const safeRenderProgress =
+			phase === "finalizing"
+				? Math.max(0, Math.min(renderProgress ?? 99, 99))
+				: undefined;
+		const percentage =
+			phase === "finalizing"
+				? safeRenderProgress ?? 99
+				: totalFrames > 0
+					? (currentFrame / totalFrames) * 100
+					: 100;
 
 		if (nowMs - this.lastThroughputLogTimeMs >= 1000 || currentFrame === totalFrames) {
 			const safeFrameCount = Math.max(this.processedFrameCount, 1);
@@ -935,13 +977,14 @@ export class ModernVideoExporter {
 			this.config.onProgress({
 				currentFrame,
 				totalFrames,
-				percentage: totalFrames > 0 ? (currentFrame / totalFrames) * 100 : 100,
+				percentage,
 				estimatedTimeRemaining,
 				renderFps: sampleRenderFps,
 				renderBackend: this.renderBackend ?? undefined,
 				encodeBackend: this.encodeBackend ?? undefined,
 				encoderName: this.encoderName ?? undefined,
 				phase,
+				renderProgress: safeRenderProgress,
 			});
 		}
 	}
@@ -1039,7 +1082,7 @@ export class ModernVideoExporter {
 		return Date.now();
 	}
 
-	private async initializeEncoder(): Promise<void> {
+	private async initializeEncoder(): Promise<SupportedMp4EncoderPath> {
 		this.encodeQueue = 0;
 		this.webCodecsEncodeQueueLimit =
 			this.config.maxEncodeQueue ??
@@ -1122,7 +1165,7 @@ export class ModernVideoExporter {
 					`[VideoExporter] Encoder error (codec: ${resolvedCodec}, ${this.config.width}x${this.config.height}):`,
 					error,
 				);
-				// Stop export — encoding failed
+				this.encoderError = error instanceof Error ? error : new Error(String(error));
 				this.cancelled = true;
 			},
 		});
@@ -1152,7 +1195,7 @@ export class ModernVideoExporter {
 						`[VideoExporter] Using ${candidate.hardwareAcceleration} ${latencyMode} encoder path with codec ${candidate.codec}`,
 					);
 					this.encoder.configure(config);
-					return;
+					return candidate;
 				}
 
 				console.warn(
@@ -1172,31 +1215,9 @@ export class ModernVideoExporter {
 	}
 
 	private getEncoderCandidates(): SupportedMp4EncoderPath[] {
-		const candidates: SupportedMp4EncoderPath[] = [];
-
-		if (this.config.preferredEncoderPath) {
-			candidates.push(this.config.preferredEncoderPath);
-		}
-
-		const codecCandidates = this.config.codec
-			? [this.config.codec, ...MP4_CODEC_FALLBACK_LIST]
-			: [...MP4_CODEC_FALLBACK_LIST];
-
-		for (const codec of codecCandidates) {
-			for (const hardwareAcceleration of ["prefer-hardware", "prefer-software"] as const) {
-				candidates.push({ codec, hardwareAcceleration });
-			}
-		}
-
-		return candidates.filter((candidate, index, values) => {
-			return (
-				values.findIndex((value) => {
-					return (
-						value.codec === candidate.codec &&
-						value.hardwareAcceleration === candidate.hardwareAcceleration
-					);
-				}) === index
-			);
+		return getOrderedSupportedMp4EncoderCandidates({
+			codec: this.config.codec,
+			preferredEncoderPath: this.config.preferredEncoderPath,
 		});
 	}
 
@@ -1292,6 +1313,7 @@ export class ModernVideoExporter {
 		this.renderFrameTimeMs = 0;
 		this.encodeWaitTimeMs = 0;
 		this.encodeWaitEvents = 0;
+		this.encoderError = null;
 		this.peakEncodeQueueSize = 0;
 		this.peakNativeWriteInFlight = 0;
 		this.nativeCaptureTimeMs = 0;

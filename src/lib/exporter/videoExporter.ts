@@ -95,10 +95,11 @@ export class VideoExporter {
 	private videoColorSpace: VideoColorSpaceInit | undefined;
 	private pendingMuxing: Promise<void> = Promise.resolve();
 	private chunkCount = 0;
-	private readonly WINDOWS_FINALIZATION_TIMEOUT_MS = 180_000;
+	private readonly FINALIZATION_TIMEOUT_MS = 600_000;
 	private exportStartTimeMs = 0;
 	private progressSampleStartTimeMs = 0;
 	private progressSampleStartFrame = 0;
+	private encoderError: Error | null = null;
 	private nativeExportSessionId: string | null = null;
 
 	constructor(config: VideoExporterConfig) {
@@ -109,6 +110,7 @@ export class VideoExporter {
 		try {
 			this.cleanup();
 			this.cancelled = false;
+			this.encoderError = null;
 			this.exportStartTimeMs = this.getNowMs();
 			this.progressSampleStartTimeMs = this.exportStartTimeMs;
 			this.progressSampleStartFrame = 0;
@@ -208,7 +210,7 @@ export class VideoExporter {
 				this.config.frameRate,
 				this.config.trimRegions,
 				this.config.speedRegions,
-				async (videoFrame, _exportTimestampUs, sourceTimestampMs) => {
+				async (videoFrame, _exportTimestampUs, sourceTimestampMs, cursorTimestampMs) => {
 					if (this.cancelled) {
 						videoFrame.close();
 						return;
@@ -216,7 +218,8 @@ export class VideoExporter {
 
 					const timestamp = frameIndex * frameDuration;
 					const sourceTimestampUs = sourceTimestampMs * 1000;
-					await this.renderer!.renderFrame(videoFrame, sourceTimestampUs);
+					const cursorTimestampUs = cursorTimestampMs * 1000;
+					await this.renderer!.renderFrame(videoFrame, sourceTimestampUs, cursorTimestampUs);
 					videoFrame.close();
 
 					if (useNativeEncoder) {
@@ -230,26 +233,37 @@ export class VideoExporter {
 			);
 
 			if (this.cancelled) {
+				const encoderError = this.encoderError as Error | null;
+				if (encoderError) {
+					return { success: false, error: encoderError.message };
+				}
+
 				return { success: false, error: "Export cancelled" };
 			}
 
+			this.reportFinalizingProgress(totalFrames, 96);
+
 			if (useNativeEncoder && nativeAudioPlan) {
+				this.reportFinalizingProgress(totalFrames, 99);
 				return await this.finishNativeVideoExport(nativeAudioPlan);
 			}
 
 			// Finalize encoding
 			if (this.encoder && this.encoder.state === "configured") {
-				await this.awaitWithWindowsTimeout(this.encoder.flush(), "encoder flush");
+				this.reportFinalizingProgress(totalFrames, 97);
+				await this.awaitWithFinalizationTimeout(this.encoder.flush(), "encoder flush");
 			}
 
 			// Wait for queued muxing operations to complete
-			await this.awaitWithWindowsTimeout(this.pendingMuxing, "muxing queued video chunks");
+			this.reportFinalizingProgress(totalFrames, 98);
+			await this.awaitWithFinalizationTimeout(this.pendingMuxing, "muxing queued video chunks");
 
 			if (hasAudio && !this.cancelled) {
 				const demuxer = this.streamingDecoder.getDemuxer();
 				if (demuxer || hasAudioRegions || hasSourceAudioFallback) {
 					this.audioProcessor = new AudioProcessor();
-					await this.awaitWithWindowsTimeout(
+					this.reportFinalizingProgress(totalFrames, 99);
+					await this.awaitWithFinalizationTimeout(
 						this.audioProcessor.process(
 							demuxer,
 							this.muxer!,
@@ -266,14 +280,20 @@ export class VideoExporter {
 			}
 
 			// Finalize muxer and get output blob
-			const blob = await this.awaitWithWindowsTimeout(this.muxer!.finalize(), "muxer finalization");
+			this.reportFinalizingProgress(totalFrames, 99);
+			const blob = await this.awaitWithFinalizationTimeout(this.muxer!.finalize(), "muxer finalization");
 
 			return { success: true, blob };
 		} catch (error) {
+			if (this.cancelled && !this.encoderError) {
+				return { success: false, error: "Export cancelled" };
+			}
+
+			const resolvedError = this.encoderError ?? error;
 			console.error("Export error:", error);
 			return {
 				success: false,
-				error: error instanceof Error ? error.message : String(error),
+				error: resolvedError instanceof Error ? resolvedError.message : String(resolvedError),
 			};
 		} finally {
 			this.cleanup();
@@ -295,18 +315,7 @@ export class VideoExporter {
 		return false;
 	}
 
-	private isWindowsPlatform(): boolean {
-		if (typeof navigator === "undefined") {
-			return false;
-		}
-		return /Win/i.test(navigator.platform);
-	}
-
-	private async awaitWithWindowsTimeout<T>(promise: Promise<T>, stage: string): Promise<T> {
-		if (!this.isWindowsPlatform()) {
-			return promise;
-		}
-
+	private async awaitWithFinalizationTimeout<T>(promise: Promise<T>, stage: string): Promise<T> {
 		let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
 		try {
@@ -314,8 +323,12 @@ export class VideoExporter {
 				promise,
 				new Promise<T>((_, reject) => {
 					timeoutId = setTimeout(() => {
-						reject(new Error(`Export timed out during ${stage} on Windows`));
-					}, this.WINDOWS_FINALIZATION_TIMEOUT_MS);
+						reject(
+							new Error(
+								`Export timed out during ${stage} after ${Math.round(this.FINALIZATION_TIMEOUT_MS / 60_000)} minutes`,
+							),
+						);
+					}, this.FINALIZATION_TIMEOUT_MS);
 				}),
 			]);
 		} finally {
@@ -497,7 +510,7 @@ export class VideoExporter {
 
 		if (audioPlan.audioMode === "edited-track") {
 			this.audioProcessor = new AudioProcessor();
-			const audioBlob = await this.awaitWithWindowsTimeout(
+			const audioBlob = await this.awaitWithFinalizationTimeout(
 				this.audioProcessor.renderEditedAudioTrack(
 					this.config.videoUrl,
 					this.config.trimRegions,
@@ -514,7 +527,7 @@ export class VideoExporter {
 		const sessionId = this.nativeExportSessionId;
 		this.nativeExportSessionId = null;
 
-		const result = await this.awaitWithWindowsTimeout(
+		const result = await this.awaitWithFinalizationTimeout(
 			window.electronAPI.nativeVideoExportFinish(sessionId, {
 				audioMode: audioPlan.audioMode,
 				audioSourcePath:
@@ -578,7 +591,16 @@ export class VideoExporter {
 		exportFrame.close();
 	}
 
-	private reportProgress(currentFrame: number, totalFrames: number) {
+	private reportFinalizingProgress(totalFrames: number, renderProgress: number) {
+		this.reportProgress(totalFrames, totalFrames, "finalizing", renderProgress);
+	}
+
+	private reportProgress(
+		currentFrame: number,
+		totalFrames: number,
+		phase: ExportProgress["phase"] = "extracting",
+		renderProgress?: number,
+	) {
 		const nowMs = this.getNowMs();
 		const elapsedSeconds = Math.max((nowMs - this.exportStartTimeMs) / 1000, 0.001);
 		const averageRenderFps = currentFrame / elapsedSeconds;
@@ -588,6 +610,16 @@ export class VideoExporter {
 		const remainingFrames = Math.max(totalFrames - currentFrame, 0);
 		const estimatedTimeRemaining =
 			averageRenderFps > 0 ? remainingFrames / averageRenderFps : 0;
+		const safeRenderProgress =
+			phase === "finalizing"
+				? Math.max(0, Math.min(renderProgress ?? 99, 99))
+				: undefined;
+		const percentage =
+			phase === "finalizing"
+				? safeRenderProgress ?? 99
+				: totalFrames > 0
+					? (currentFrame / totalFrames) * 100
+					: 100;
 
 		if (sampleElapsedMs >= PROGRESS_SAMPLE_WINDOW_MS) {
 			this.progressSampleStartTimeMs = nowMs;
@@ -598,9 +630,11 @@ export class VideoExporter {
 			this.config.onProgress({
 				currentFrame,
 				totalFrames,
-				percentage: totalFrames > 0 ? (currentFrame / totalFrames) * 100 : 100,
+				percentage,
 				estimatedTimeRemaining,
 				renderFps,
+				phase,
+				renderProgress: safeRenderProgress,
 			});
 		}
 	}
@@ -678,7 +712,7 @@ export class VideoExporter {
 					`[VideoExporter] Encoder error (codec: ${resolvedCodec}, ${this.config.width}x${this.config.height}):`,
 					error,
 				);
-				// Stop export — encoding failed
+				this.encoderError = error instanceof Error ? error : new Error(String(error));
 				this.cancelled = true;
 			},
 		});
@@ -793,6 +827,7 @@ export class VideoExporter {
 		this.encodeQueue = 0;
 		this.pendingMuxing = Promise.resolve();
 		this.chunkCount = 0;
+		this.encoderError = null;
 		this.videoDescription = undefined;
 		this.videoColorSpace = undefined;
 	}
